@@ -1,0 +1,6 @@
+flask
+sentence-transformers
+faiss-cpu
+chardet
+pdfplumber
+orjson

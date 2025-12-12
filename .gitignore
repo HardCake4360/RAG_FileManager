@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.env
+logs/
+data/**/cache/
+# OS
+Thumbs.db
+# Virtual env (필요시)
+.venv/
+venv/
