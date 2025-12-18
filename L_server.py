@@ -482,8 +482,6 @@ def upsert_file_info(path: str, ext: str, tags: List[str], snippet: str, use_llm
 
     rec = files_db.get(path)
     if rec is None:
-        # Initialize deleted flags for new records. These flags are used
-        # for soft-deletion support and must default to False.
         files_db[path] = {
             "name": base,
             "path": path,
@@ -493,9 +491,7 @@ def upsert_file_info(path: str, ext: str, tags: List[str], snippet: str, use_llm
             "size": fp["size"],
             "mtime": fp["mtime"],
             "first_indexed": now,
-            "last_indexed": now,
-            "deleted": False,
-            "deleted_at": None
+            "last_indexed": now
         }
     else:
         rec.update({
@@ -606,9 +602,7 @@ def search_text(query: str, top_k: int = 20, filters: Dict[str, Any] = None) -> 
                 continue
         path = m["path"]
         info = files_db.get(path)
-        # Skip files that have been soft-deleted. When the 'deleted' flag is set
-        # the file is treated as removed from search results without reindexing.
-        if not info or info.get("deleted"):
+        if not info:
             continue
         cur = results_by_file.get(path)
         if (not cur) or (sc > cur["score"]):
@@ -751,105 +745,6 @@ def index_scan():
     }), 200
 
 
-# --------------------------
-# Index Rebuild (Refresh)
-# --------------------------
-@app.post("/index/rebuild")
-def index_rebuild():
-    """
-    Fully rebuild the text and image indexes from a root directory.
-
-    This endpoint is similar to /index/scan but clears existing indexes
-    and repopulates them from scratch. It preserves the deleted flags for
-    previously soft-deleted files by reapplying the tombstones after the
-    rebuild completes.
-
-    Request JSON:
-    {
-      "root": "<directory>",
-      "options": {
-         "max_text_kb": 512,
-         "chunk": true,
-         "llm_desc": true,
-         "scan_images": true
-      }
-    }
-    """
-    t0 = time.time()
-    payload = request.get_json(force=True) or {}
-    root = (payload.get("root") or "").strip()
-    if not root or not os.path.isdir(root):
-        return jsonify({"ok": False, "msg": f"bad root: {root}"}), 400
-    options = payload.get("options") or {}
-    max_text_kb = int(options.get("max_text_kb", 512))
-    chunk       = bool(options.get("chunk", True))
-    llm_desc    = bool(options.get("llm_desc", True))
-    scan_images = bool(options.get("scan_images", True))
-    # Take a snapshot of current tombstoned (deleted) paths
-    deleted_paths = {p for p, rec in files_db.items() if rec.get("deleted")}
-    # Rebuild text index from scratch
-    scanned_text, f_added_text, c_added_text = full_rebuild_from_root(root, {
-        "max_text_kb": max_text_kb,
-        "chunk": chunk,
-        "llm_desc": llm_desc
-    })
-    # Clear and rebuild image index/meta
-    global faiss_index_img, meta_img, D_IMG
-    faiss_index_img = None
-    D_IMG = None
-    meta_img = []
-    f_added_img = 0
-    if scan_images:
-        img_paths = list(iter_files_under(root, IMAGE_EXT))
-        for p in img_paths:
-            # Skip files that were previously deleted
-            if p in deleted_paths:
-                continue
-            try:
-                f, _ = add_image_to_index(p)
-                f_added_img += int(f)
-            except Exception as e:
-                app.logger.error(f"[index_rebuild][image] skip {p}: {e}")
-    # Reapply tombstone flags to rebuilt files_db
-    for p in deleted_paths:
-        if p in files_db:
-            files_db[p]["deleted"] = True
-            files_db[p]["deleted_at"] = files_db[p].get("deleted_at", time.time())
-    # Persist indexes and metadata
-    try:
-        save_index_and_meta()
-    except Exception as e:
-        app.logger.error(f"[index_rebuild] save_index_and_meta error: {e}")
-    try:
-        save_image_index_and_meta()
-    except Exception as e:
-        app.logger.error(f"[index_rebuild] save_image_index_and_meta error: {e}")
-    elapsed = round(time.time() - t0, 3)
-    return jsonify({
-        "ok": True,
-        "root": root,
-        "options": {
-            "max_text_kb": max_text_kb,
-            "chunk": chunk,
-            "llm_desc": llm_desc,
-            "scan_images": scan_images
-        },
-        "summary": {
-            "textlike": {
-                "scanned": scanned_text,
-                "added_files": f_added_text,
-                "added_chunks": c_added_text
-            },
-            "image": {
-                "scanned": len(list(iter_files_under(root, IMAGE_EXT))) if scan_images else 0,
-                "added_files": f_added_img
-            }
-        },
-        "files_total": len(files_db),
-        "elapsed_sec": elapsed
-    }), 200
-
-
 @app.post("/search")
 def search():
     payload = request.get_json(force=True) or {}
@@ -873,50 +768,6 @@ def search():
     
     results = search_text(query, top_k=top_k, filters=filters)
     return jsonify({"results": results, "count": len(results)})
-
-# --------------------------
-# File Deletion (Soft Delete)
-# --------------------------
-@app.post("/file/delete")
-def delete_file():
-    """
-    Soft-delete a previously indexed file.
-
-    Request JSON:
-    {
-        "path": "<absolute file path>"
-    }
-    This will mark the file as deleted in files_db and remove its thumbnail
-    if present. Subsequent searches will no longer return results for this file.
-    """
-    payload = request.get_json(force=True) or {}
-    path = (payload.get("path") or "").strip()
-    if not path:
-        return jsonify({"ok": False, "msg": "path missing"}), 400
-    # Only allow deletion of files that have been indexed
-    info = files_db.get(path)
-    if not info:
-        return jsonify({"ok": False, "msg": "file not indexed"}), 404
-    # Mark as deleted
-    info["deleted"] = True
-    info["deleted_at"] = time.time()
-    # Remove thumbnail if it exists on disk
-    thumb = info.get("thumbnail")
-    if thumb and os.path.isfile(thumb):
-        try:
-            os.remove(thumb)
-        except Exception:
-            pass
-    # Persist the updated state so the deletion survives restarts
-    try:
-        save_index_and_meta()
-    except Exception as e:
-        app.logger.error(f"[delete_file] save_index_and_meta error: {e}")
-    try:
-        save_image_index_and_meta()
-    except Exception as e:
-        app.logger.error(f"[delete_file] save_image_index_and_meta error: {e}")
-    return jsonify({"ok": True, "path": path, "deleted": True})
 
 
 @app.get("/health")
